@@ -76,6 +76,8 @@ contract TakeProfitsHook is BaseHook, ERC1155 {
 
     mapping(uint256 positionId => uint256 outputClaimable) public claimableOutputTokens;
 
+    mapping(PoolId poolId => int24 lastTick) public lastTicks;
+
     //Constructor
     constructor(IPoolManager _manager, string memory _uri) BaseHook(_manager) ERC1155(_uri) {}
 
@@ -108,7 +110,8 @@ contract TakeProfitsHook is BaseHook, ERC1155 {
         onlyByPoolManager
         returns (bytes4)
     {
-        // TODO:
+        //Initializing the lastTick value to the initial tick.
+        lastTicks[key.toId()] = tick;
 
         return this.afterInitialize.selector;
     }
@@ -120,7 +123,20 @@ contract TakeProfitsHook is BaseHook, ERC1155 {
         BalanceDelta,
         bytes calldata
     ) external override onlyByPoolManager returns (bytes4, int128) {
-        //TODO:
+        //return early if the sender is the hook address.
+        if (sender == address(this)) return (this.afterSwap.selector, 0);
+
+        //initalizing local variables to capture if we need to execute order and currentTick
+        bool tryMore = true;
+        int24 currentTick;
+
+        //TryMore is false if no order is executed and will remain true if we successfully execute an order and the tick value changes prompting to check if there are any more orders.
+        while (tryMore) {
+            (tryMore, currentTick) = tryExecutingOrders(key, !params.zeroForOne);
+        }
+
+        //updating the last tick value if the orders are executed changing the currentTick value.
+        lastTicks[key.toId()] = currentTick;
 
         return (this.afterSwap.selector, 0);
     }
@@ -261,6 +277,52 @@ contract TakeProfitsHook is BaseHook, ERC1155 {
 
         //Updating claim tokens for the position provided with the calculated output amount.
         claimableOutputTokens[positionId] += outputAmount;
+    }
+
+    function tryExecutingOrders(PoolKey calldata key, bool executeZeroForOne)
+        internal
+        returns (bool tryMore, int24 newTick)
+    {
+        //Fetching the last tick and currentTick
+        int24 lastTick = lastTicks[key.toId()];
+        (, int24 currentTick,,) = poolManager.getSlot0(key.toId());
+
+        /**
+         * currentTick > lastTick
+         * Token0 price has increased i.e users are buying token0 by selling token1
+         * Check if any orders to sell token0 at btw the range of lastTick to currentTick
+         */
+        if (currentTick > lastTick) {
+            //looping over all the values btw lastTick and currentTick
+            for (int24 tick = lastTick; tick <= currentTick; tick += key.tickSpacing) {
+                uint256 inputAmount = pendingOrders[key.toId()][tick][executeZeroForOne];
+
+                if (inputAmount > 0) {
+                    executeOrder(key, tick, executeZeroForOne, inputAmount);
+
+                    //Returing true cause we might have more orders to execute btw the currentTick and lastTick
+                    return (true, currentTick);
+                }
+            }
+        } else {
+            /**
+             * currentTick < lastTick
+             * token1 price is increased i.e. users are selling token1 to buy token0
+             * check for any orders to sell token1 btw the range of lastTick to currentTick
+             */
+            for (int24 tick = lastTick; tick >= currentTick; tick -= key.tickSpacing) {
+                uint256 inputAmount = pendingOrders[key.toId()][tick][executeZeroForOne];
+
+                if (inputAmount > 0) {
+                    executeOrder(key, tick, executeZeroForOne, inputAmount);
+
+                    //Returing true cause we might have more orders to execute btw the currentTick and lastTick
+                    return (true, currentTick);
+                }
+            }
+        }
+        //returing false and the current tick value if no orders are found to execute.
+        return (false, currentTick);
     }
 
     function _settle(Currency currency, uint128 amount) internal {

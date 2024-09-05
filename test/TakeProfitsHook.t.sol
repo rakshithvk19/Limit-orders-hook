@@ -119,21 +119,6 @@ contract TakeProfitsHookTest is Test, Deployers {
         assertEq(tokenBalance, amount);
     }
 
-    /**
-     * Adding this code snippet because ERC-1155 implimentation by OpenZeppline does not allow ERC-1155 tokens to be transferred to EOA account
-     */
-    function onERC1155Received(address, address, uint256, uint256, bytes calldata) external pure returns (bytes4) {
-        return this.onERC1155Received.selector;
-    }
-
-    function onERC1155BatchReceived(address, address, uint256[] calldata, uint256[] calldata, bytes calldata)
-        external
-        pure
-        returns (bytes4)
-    {
-        return this.onERC1155BatchReceived.selector;
-    }
-
     function test_cancelOrder() public {
         //Initializing order params
         int24 tick = 100;
@@ -165,5 +150,170 @@ contract TakeProfitsHookTest is Test, Deployers {
 
         tokenBalance = hook.balanceOf(address(this), positionId);
         assertEq(tokenBalance, 0);
+    }
+
+    /**
+     * @dev testing takeProfitOrder for zeroForOne swap
+     */
+    function test_orderExecute_zeroForOne() public {
+        //initializing variable to place order.
+        int24 tick = 100;
+        uint256 amount = 1 ether;
+        bool zeroForOne = true;
+
+        //Placing takeProfitOrder at tick = 100 for 1e18 token0
+        int24 tickLower = hook.placeOrder(key, tick, zeroForOne, amount);
+
+        //Initializing swap params
+        IPoolManager.SwapParams memory params = IPoolManager.SwapParams({
+            zeroForOne: !zeroForOne,
+            amountSpecified: -1 ether,
+            sqrtPriceLimitX96: TickMath.MAX_SQRT_PRICE - 1
+        });
+
+        PoolSwapTest.TestSettings memory testSettings =
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false});
+
+        //Swapping 1e18 of token1 for token0
+        swapRouter.swap(key, params, testSettings, ZERO_BYTES);
+
+        //Verifying the takeProfitOrder is successful by asserting that no pedingTokens are remaining.
+        uint256 pendingTokensForPosition = hook.pendingOrders(key.toId(), tick, zeroForOne);
+        assertEq(pendingTokensForPosition, 0);
+
+        //Verifying that the hook contract has enough token1 ready to be redeemed.
+        uint256 positionId = hook.getPositionId(key, tickLower, zeroForOne);
+        uint256 claimableOutputTokens = hook.claimableOutputTokens(positionId);
+        uint256 hookContractToken1Balance = token1.balanceOf(address(hook));
+        assertEq(claimableOutputTokens, hookContractToken1Balance);
+
+        //Redeeming available token1 in the hook contract.
+        uint256 originalToken1Balance = token1.balanceOf(address(this));
+        hook.redeem(key, tick, zeroForOne, amount);
+        uint256 newToken1Balance = token1.balanceOf(address(this));
+        assertEq(newToken1Balance - originalToken1Balance, claimableOutputTokens);
+    }
+
+    /**
+     * @dev testing for takeProfitOrder for oneForZero swap
+     */
+    function test_orderExecute_oneForZero() public {
+        //initializing takeProfitOrder variables
+        int24 tick = -100;
+        uint256 amount = 10 ether;
+        bool zeroForOne = false;
+
+        //Placing take profit order at tick = -100 for 10e18 of token1
+        int24 tickLower = hook.placeOrder(key, tick, zeroForOne, amount);
+
+        //Initializing swap params and swap settings
+        IPoolManager.SwapParams memory params = IPoolManager.SwapParams({
+            zeroForOne: true,
+            amountSpecified: -1 ether,
+            sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+        });
+
+        PoolSwapTest.TestSettings memory testSettings =
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false});
+
+        //Buying 1e18 token0 for token1
+        swapRouter.swap(key, params, testSettings, ZERO_BYTES);
+
+        //Verifying takeProfitOrder is successful by asserting that there are no pending tokens remaining
+        uint256 tokensLeftToSell = hook.pendingOrders(key.toId(), tick, zeroForOne);
+        assertEq(tokensLeftToSell, 0);
+
+        //Verifying the hook contract has enough token0 to redeem.
+        uint256 positionId = hook.getPositionId(key, tickLower, zeroForOne);
+        uint256 claimableOutputTokens = hook.claimableOutputTokens(positionId);
+        uint256 hookContractToken0Balance = token0.balanceOf(address(hook));
+        assertEq(claimableOutputTokens, hookContractToken0Balance);
+
+        //redeeming token0 available in the hook contract.
+        uint256 originalToken0Balance = token0.balanceOfSelf();
+        hook.redeem(key, tick, zeroForOne, amount);
+        uint256 newToken0Balance = token0.balanceOfSelf();
+
+        assertEq(newToken0Balance - originalToken0Balance, claimableOutputTokens);
+    }
+
+    /**
+     * @dev testing multiple takeProfitOrder for zeroForOne swap. Swap changes the tick such that only the takeProfitOrder that is in range is of currentTick and the lastTick is executed
+     */
+    function test_multiple_orderExecute_zeroForOne_onlyOne() public {
+        //Placing two takeProfitOrder, one at tick = 0 and tick = 60
+        uint256 amount = 0.01 ether;
+        hook.placeOrder(key, 0, true, amount);
+        hook.placeOrder(key, 60, true, amount);
+
+        //Verifying that the current tick is 0 initially
+        (, int24 currentTick,,) = manager.getSlot0(key.toId());
+        assertEq(currentTick, 0);
+
+        //Initializing swap params and test settings
+        IPoolManager.SwapParams memory params = IPoolManager.SwapParams({
+            zeroForOne: false,
+            amountSpecified: -0.1 ether,
+            sqrtPriceLimitX96: TickMath.MAX_SQRT_PRICE - 1
+        });
+
+        PoolSwapTest.TestSettings memory testSettings =
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false});
+
+        //Performing the swap
+        swapRouter.swap(key, params, testSettings, ZERO_BYTES);
+
+        //Verifying that the takeProfitOrder at tick = 0 is executed.
+        uint256 tokensLeftToSell = hook.pendingOrders(key.toId(), 0, true);
+        assertEq(tokensLeftToSell, 0);
+
+        //Verifying that the takeProfitOrder at tick = 60 is still pending.
+        tokensLeftToSell = hook.pendingOrders(key.toId(), 60, true);
+        assertEq(tokensLeftToSell, amount);
+    }
+
+    /**
+     * @dev testing for multiple takeProfitOrders placed and both of them are executed.
+     */
+    function test_multiple_orderExecute_zeroForOne_both() public {
+        //Placing takeProfitOrders at tick = 0 and tick = 60
+        uint256 amount = 0.01 ether;
+        hook.placeOrder(key, 0, true, amount);
+        hook.placeOrder(key, 60, true, amount);
+
+        //Initializing swap params and pool test settings
+        IPoolManager.SwapParams memory params = IPoolManager.SwapParams({
+            zeroForOne: false,
+            amountSpecified: -0.5 ether,
+            sqrtPriceLimitX96: TickMath.MAX_SQRT_PRICE - 1
+        });
+
+        PoolSwapTest.TestSettings memory testSettings =
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false});
+
+        //Swapping to increase the tick value
+        swapRouter.swap(key, params, testSettings, ZERO_BYTES);
+
+        //verifying that both the takeProfitOrder is executed i.e. at tick = 0 and also at tick = 60
+        uint256 tokensLeftToSell = hook.pendingOrders(key.toId(), 0, true);
+        assertEq(tokensLeftToSell, 0);
+
+        tokensLeftToSell = hook.pendingOrders(key.toId(), 60, true);
+        assertEq(tokensLeftToSell, 0);
+    }
+
+    /**
+     * Adding this code snippet because ERC-1155 implimentation by OpenZeppline does not allow ERC-1155 tokens to be transferred to EOA account
+     */
+    function onERC1155Received(address, address, uint256, uint256, bytes calldata) external pure returns (bytes4) {
+        return this.onERC1155Received.selector;
+    }
+
+    function onERC1155BatchReceived(address, address, uint256[] calldata, uint256[] calldata, bytes calldata)
+        external
+        pure
+        returns (bytes4)
+    {
+        return this.onERC1155BatchReceived.selector;
     }
 }
